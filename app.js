@@ -75,9 +75,20 @@ function sample(logits, temperature, topK) {
   for (let k = 0; k < idx.length; k++) { r -= pr[k]; if (r <= 0) return idx[k]; }
   return idx[0];
 }
+// 直前の会話(history)を、文字数の予算内で入力の前に付ける
+function buildPrompt(history, msg, maxChars) {
+  const cur = `ユーザー:${msg}\nAI:`;
+  const hist = [];
+  for (let i = history.length - 1; i >= 0 && hist.length < 3; i--) {
+    const piece = `ユーザー:${history[i].q}\nAI:${history[i].a}\n`;
+    if ([...(piece + hist.join('') + cur)].length > maxChars) break;
+    hist.unshift(piece);
+  }
+  return hist.join('') + cur;
+}
 function reply(m, msg, opt = {}) {
-  const { temperature = 0.7, topK = 20, maxNew = 120 } = opt, B = m.cfg.block_size;
-  const ids = [...`ユーザー:${msg}\nAI:`].map(c => m.stoi[c] ?? 0);
+  const { temperature = 0.7, topK = 20, maxNew = 120, history = [] } = opt, B = m.cfg.block_size;
+  const ids = [...buildPrompt(history, msg, Math.floor(B * 0.6))].map(c => m.stoi[c] ?? 0);
   let out = '';
   for (let n = 0; n < maxNew; n++) {
     const ch = m.chars[sample(lastLogits(m, ids.slice(-B)), temperature, topK)];
@@ -87,12 +98,21 @@ function reply(m, msg, opt = {}) {
   return out;
 }
 
-
 // ---- 教えたデータの管理 ----
-const clean = (s) => String(s).replace(/[\r\n]+/g, ' ').trim();
+const clean = (x) => String(x).replace(/[\r\n]+/g, ' ').trim();
+// 教えた1件 = { q, a, ctx: {q,a}|null, sent }。ctxは「その直前のやり取り」(続きの会話として教えた場合)
 function buildExport(items) {
-  return items.filter(it => !it.sent).map(it => `ユーザー:${clean(it.q)}\nAI:${clean(it.a)}\n`).join('');
+  return items.filter(it => !it.sent).map(it =>
+    (it.ctx ? `ユーザー:${clean(it.ctx.q)}\nAI:${clean(it.ctx.a)}\n` : '') +
+    `ユーザー:${clean(it.q)}\nAI:${clean(it.a)}\n`).join('');
 }
+// 教えた質問に即答するための検索（続きの会話は、直前の質問が一致したときだけ）
+function findTaught(taught, history, msg) {
+  const c = clean(msg), last = history[history.length - 1];
+  const cands = taught.filter(t => t.q === c);
+  return cands.find(t => t.ctx && last && t.ctx.q === last.q) || cands.find(t => !t.ctx);
+}
+const sameCtx = (a, b) => (!a && !b) || (a && b && a.q === b.q && a.a === b.a);
 const b64enc = (str) => { let bin = ''; new TextEncoder().encode(str).forEach(x => bin += String.fromCharCode(x)); return btoa(bin); };
 const b64dec = (b64) => new TextDecoder().decode(Uint8Array.from(atob(b64.replace(/\n/g, '')), c => c.charCodeAt(0)));
 
@@ -113,14 +133,14 @@ async function appendToGitHub({ repo, token, items, fetchFn = fetch }) {
   if (!p.ok) throw new Error(`書き込みに失敗 (${p.status})`);
 }
 
-if (typeof module !== 'undefined') module.exports = { loadModel, lastLogits, reply, buildExport, appendToGitHub };
+if (typeof module !== 'undefined') module.exports = { loadModel, lastLogits, reply, buildPrompt, buildExport, findTaught, appendToGitHub };
 if (typeof document !== 'undefined') {
   const $ = (id) => document.getElementById(id);
   const log = $('log'), form = $('form'), input = $('input'), btn = $('send');
   const KEY = 'tiny-chat-ai-taught';
-  const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch (e) { return []; } };
+  const load = () => { try { return (JSON.parse(localStorage.getItem(KEY)) || []).map(t => ({ ctx: null, ...t })); } catch (e) { return []; } };
   const save = (v) => { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} };
-  let taught = load();
+  let taught = load(), history = [];
   const countEl = $('count');
   const updateCount = () => { countEl.textContent = taught.filter(t => !t.sent).length; };
   updateCount();
@@ -129,15 +149,18 @@ if (typeof document !== 'undefined') {
     const d = document.createElement('div'); d.className = 'msg ' + who; d.textContent = text;
     log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
   };
-  const teach = (q, a) => {
-    taught = taught.filter(t => clean(t.q) !== clean(q)); // 同じ質問は上書き
-    taught.push({ q: clean(q), a: clean(a), sent: false }); save(taught); updateCount();
+  const teach = (q, a, ctx) => {
+    taught = taught.filter(t => !(t.q === clean(q) && sameCtx(t.ctx, ctx)));
+    taught.push({ q: clean(q), a: clean(a), ctx, sent: false }); save(taught); updateCount();
   };
-  const addTeachButton = (bubble, q) => {
+  const addTeachButton = (bubble, q, ctx) => {
     const b = document.createElement('button'); b.className = 'teach'; b.textContent = '教える';
     b.onclick = () => {
       const a = prompt(`「${q}」への正しい返事を入力してください`);
-      if (a && a.trim()) { teach(q, a); b.textContent = '覚えました ✓'; b.disabled = true; }
+      if (!a || !a.trim()) return;
+      let useCtx = null;
+      if (ctx && confirm('直前のやり取りも一緒に教えますか？\n（「それって何？」のような、続きの会話として教えたいときは OK）')) useCtx = ctx;
+      teach(q, a, useCtx); b.textContent = '覚えました ✓'; b.disabled = true;
     };
     bubble.appendChild(document.createElement('br')); bubble.appendChild(b);
   };
@@ -153,21 +176,51 @@ if (typeof document !== 'undefined') {
     const msg = input.value.trim(); if (!msg || !model) return;
     input.value = ''; add('me', msg); btn.disabled = true;
     const thinking = add('ai', '…');
+    const ctx = history.length ? { ...history[history.length - 1] } : null;
     setTimeout(() => {
-      const hit = taught.find(t => t.q === clean(msg)); // 教えた質問には即答
-      thinking.textContent = hit ? hit.a : (reply(model, msg) || '（……）');
-      addTeachButton(thinking, msg);
+      const hit = findTaught(taught, history, msg); // 教えた質問には即答
+      const ans = hit ? hit.a : (reply(model, msg, { history }) || '（……）');
+      thinking.textContent = ans;
+      history.push({ q: clean(msg), a: clean(ans) }); if (history.length > 6) history.shift();
+      addTeachButton(thinking, msg, ctx);
       btn.disabled = false; input.focus(); log.scrollTop = log.scrollHeight;
     }, 30);
   });
+  $('newChat').onclick = () => { history = []; add('ai', '新しい会話を始めます。前の話は忘れました。'); };
 
-  // 書き出し
-  const dlg = $('export'), box = $('exportText');
-  $('openExport').onclick = () => { box.value = buildExport(taught); dlg.hidden = false; };
+  // ---- 教えた内容の一覧・編集 ----
+  const dlg = $('export'), list = $('list');
+  const renderList = () => {
+    list.textContent = '';
+    if (!taught.length) { list.textContent = 'まだ教えた内容はありません。'; return; }
+    taught.forEach((t, i) => {
+      const row = document.createElement('div'); row.className = 'row-item';
+      const body = document.createElement('div'); body.className = 'body';
+      const lines = [];
+      if (t.ctx) lines.push(`（直前）ユーザー: ${t.ctx.q} / AI: ${t.ctx.a}`);
+      lines.push(`ユーザー: ${t.q}`, `AI: ${t.a}`);
+      lines.forEach(l => { const p = document.createElement('div'); p.textContent = l; body.appendChild(p); });
+      const tag = document.createElement('span'); tag.className = 'tag ' + (t.sent ? 'sent' : 'pending');
+      tag.textContent = t.sent ? '反映済み' : '未反映'; body.appendChild(tag);
+      const ed = document.createElement('button'); ed.className = 'small'; ed.textContent = '編集';
+      ed.onclick = () => {
+        const a = prompt('返事を直してください', t.a);
+        if (a && a.trim()) { t.a = clean(a); t.sent = false; save(taught); updateCount(); renderList(); }
+      };
+      const del = document.createElement('button'); del.className = 'small del'; del.textContent = '削除';
+      del.onclick = () => {
+        if (!confirm(t.sent ? 'この端末の記録から削除します。\n（GitHubの data.txt からは消えません）' : 'この内容を削除しますか？')) return;
+        taught.splice(i, 1); save(taught); updateCount(); renderList();
+      };
+      row.append(body, ed, del); list.appendChild(row);
+    });
+  };
+  $('openExport').onclick = () => { renderList(); dlg.hidden = false; };
   $('closeExport').onclick = () => { dlg.hidden = true; };
   $('copyExport').onclick = async () => {
-    try { await navigator.clipboard.writeText(box.value); } catch (e) { box.select(); document.execCommand('copy'); }
-    $('copyExport').textContent = 'コピーしました ✓'; setTimeout(() => $('copyExport').textContent = 'コピー', 1500);
+    const text = buildExport(taught); if (!text) { alert('コピーする内容がありません'); return; }
+    try { await navigator.clipboard.writeText(text); } catch (e) { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+    $('copyExport').textContent = 'コピーしました ✓'; setTimeout(() => $('copyExport').textContent = '未反映をコピー', 1500);
   };
   $('pushGithub').onclick = async () => {
     const pending = taught.filter(t => !t.sent);
@@ -180,15 +233,10 @@ if (typeof document !== 'undefined') {
     try {
       await appendToGitHub({ repo: repo.trim(), token: token.trim(), items: taught });
       localStorage.setItem('tca-repo', repo.trim()); localStorage.setItem('tca-token', token.trim());
-      taught.forEach(t => t.sent = true); save(taught); updateCount(); box.value = '';
+      taught.forEach(t => t.sent = true); save(taught); updateCount(); renderList();
       alert('GitHubに反映しました。数分で再学習され、公開ページが入れ替わります。');
     } catch (e) { alert('失敗しました: ' + e.message); }
     b.disabled = false; b.textContent = 'GitHubに反映';
   };
-  $('resetToken').onclick = () => { localStorage.removeItem('tca-token'); localStorage.removeItem('tca-repo'); alert('保存したトークンを消しました'); };
-  $('clearTaught').onclick = () => {
-    if (confirm('教えた内容をすべて消しますか？（即答の記憶も消えます）')) {
-      taught = []; save(taught); updateCount(); box.value = '';
-    }
-  };
+  $('resetToken').onclick = (e) => { e.preventDefault(); localStorage.removeItem('tca-token'); localStorage.removeItem('tca-repo'); alert('保存したトークンを消しました'); };
 }
