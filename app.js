@@ -87,24 +87,108 @@ function reply(m, msg, opt = {}) {
   return out;
 }
 
-if (typeof module !== 'undefined') module.exports = { loadModel, lastLogits, reply };
+
+// ---- 教えたデータの管理 ----
+const clean = (s) => String(s).replace(/[\r\n]+/g, ' ').trim();
+function buildExport(items) {
+  return items.filter(it => !it.sent).map(it => `ユーザー:${clean(it.q)}\nAI:${clean(it.a)}\n`).join('');
+}
+const b64enc = (str) => { let bin = ''; new TextEncoder().encode(str).forEach(x => bin += String.fromCharCode(x)); return btoa(bin); };
+const b64dec = (b64) => new TextDecoder().decode(Uint8Array.from(atob(b64.replace(/\n/g, '')), c => c.charCodeAt(0)));
+
+// 未送信の「教えた内容」を、GitHubの data.txt の末尾に1コミットで追記する（→ Actionsが自動で再学習）
+async function appendToGitHub({ repo, token, items, fetchFn = fetch }) {
+  const add = buildExport(items);
+  if (!add) throw new Error('送る内容がありません');
+  const url = `https://api.github.com/repos/${repo}/contents/data.txt`;
+  const headers = { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' };
+  const g = await fetchFn(url, { headers });
+  if (!g.ok) throw new Error(`data.txt の取得に失敗 (${g.status})。リポジトリ名とトークンの権限を確認してください`);
+  const cur = await g.json();
+  let text = b64dec(cur.content); if (text && !text.endsWith('\n')) text += '\n';
+  const p = await fetchFn(url, {
+    method: 'PUT', headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: `teach: ${items.filter(i => !i.sent).length}件追加`, content: b64enc(text + add), sha: cur.sha })
+  });
+  if (!p.ok) throw new Error(`書き込みに失敗 (${p.status})`);
+}
+
+if (typeof module !== 'undefined') module.exports = { loadModel, lastLogits, reply, buildExport, appendToGitHub };
 if (typeof document !== 'undefined') {
-  const log = document.getElementById('log'), form = document.getElementById('form'),
-        input = document.getElementById('input'), btn = document.getElementById('send');
+  const $ = (id) => document.getElementById(id);
+  const log = $('log'), form = $('form'), input = $('input'), btn = $('send');
+  const KEY = 'tiny-chat-ai-taught';
+  const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch (e) { return []; } };
+  const save = (v) => { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} };
+  let taught = load();
+  const countEl = $('count');
+  const updateCount = () => { countEl.textContent = taught.filter(t => !t.sent).length; };
+  updateCount();
+
   const add = (who, text) => {
     const d = document.createElement('div'); d.className = 'msg ' + who; d.textContent = text;
     log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
   };
+  const teach = (q, a) => {
+    taught = taught.filter(t => clean(t.q) !== clean(q)); // 同じ質問は上書き
+    taught.push({ q: clean(q), a: clean(a), sent: false }); save(taught); updateCount();
+  };
+  const addTeachButton = (bubble, q) => {
+    const b = document.createElement('button'); b.className = 'teach'; b.textContent = '教える';
+    b.onclick = () => {
+      const a = prompt(`「${q}」への正しい返事を入力してください`);
+      if (a && a.trim()) { teach(q, a); b.textContent = '覚えました ✓'; b.disabled = true; }
+    };
+    bubble.appendChild(document.createElement('br')); bubble.appendChild(b);
+  };
+
   let model = null;
   const status = add('ai', 'モデルを読み込み中…');
   fetch('model.json').then(r => r.json()).then(j => {
     model = loadModel(j); status.textContent = '準備できました。話しかけてみてください！';
   }).catch(e => { status.textContent = '読み込みに失敗しました: ' + e; });
+
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     const msg = input.value.trim(); if (!msg || !model) return;
     input.value = ''; add('me', msg); btn.disabled = true;
     const thinking = add('ai', '…');
-    setTimeout(() => { thinking.textContent = reply(model, msg) || '（……）'; btn.disabled = false; input.focus(); }, 30);
+    setTimeout(() => {
+      const hit = taught.find(t => t.q === clean(msg)); // 教えた質問には即答
+      thinking.textContent = hit ? hit.a : (reply(model, msg) || '（……）');
+      addTeachButton(thinking, msg);
+      btn.disabled = false; input.focus(); log.scrollTop = log.scrollHeight;
+    }, 30);
   });
+
+  // 書き出し
+  const dlg = $('export'), box = $('exportText');
+  $('openExport').onclick = () => { box.value = buildExport(taught); dlg.hidden = false; };
+  $('closeExport').onclick = () => { dlg.hidden = true; };
+  $('copyExport').onclick = async () => {
+    try { await navigator.clipboard.writeText(box.value); } catch (e) { box.select(); document.execCommand('copy'); }
+    $('copyExport').textContent = 'コピーしました ✓'; setTimeout(() => $('copyExport').textContent = 'コピー', 1500);
+  };
+  $('pushGithub').onclick = async () => {
+    const pending = taught.filter(t => !t.sent);
+    if (!pending.length) { alert('送る内容がありません'); return; }
+    let repo = localStorage.getItem('tca-repo'), token = localStorage.getItem('tca-token');
+    if (!repo) { repo = prompt('GitHubのリポジトリ名（例: ユーザー名/tiny-chat-ai）', 'masa64xmasa-hub/tiny-chat-ai'); }
+    if (!token) { token = prompt('GitHubのトークン（この端末のブラウザにだけ保存されます）'); }
+    if (!repo || !token) return;
+    const b = $('pushGithub'); b.disabled = true; b.textContent = '送信中…';
+    try {
+      await appendToGitHub({ repo: repo.trim(), token: token.trim(), items: taught });
+      localStorage.setItem('tca-repo', repo.trim()); localStorage.setItem('tca-token', token.trim());
+      taught.forEach(t => t.sent = true); save(taught); updateCount(); box.value = '';
+      alert('GitHubに反映しました。数分で再学習され、公開ページが入れ替わります。');
+    } catch (e) { alert('失敗しました: ' + e.message); }
+    b.disabled = false; b.textContent = 'GitHubに反映';
+  };
+  $('resetToken').onclick = () => { localStorage.removeItem('tca-token'); localStorage.removeItem('tca-repo'); alert('保存したトークンを消しました'); };
+  $('clearTaught').onclick = () => {
+    if (confirm('教えた内容をすべて消しますか？（即答の記憶も消えます）')) {
+      taught = []; save(taught); updateCount(); box.value = '';
+    }
+  };
 }
