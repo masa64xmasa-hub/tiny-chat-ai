@@ -3,12 +3,12 @@
   python chat_gpt.py train   # data.txt で学習して model.pt / vocab.json を保存
   python chat_gpt.py chat    # 学習済みモデルとチャット
 """
-import sys, json, torch, torch.nn as nn, torch.nn.functional as F
+import os, sys, json, torch, torch.nn as nn, torch.nn.functional as F
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # CPU(Codespaces)向けの軽い設定。GPUなら大きくしてOK
 block_size, n_embd, n_head, n_layer, dropout = 128, 128, 4, 2, 0.1
-batch_size, max_iters, lr = 32, 1500, 5e-4
+batch_size, max_iters, lr = 32, int(os.environ.get('ITERS', 1500)), 5e-4
 
 
 class Block(nn.Module):
@@ -51,6 +51,8 @@ class GPT(nn.Module):
 
 def train():
     text = open('data.txt', encoding='utf-8').read()
+    if len(text) < 20000:  # 少量データは繰り返して学習量を確保
+        text = text * (20000 // max(len(text), 1) + 1)
     chars = sorted(set(text))
     stoi = {c: i for i, c in enumerate(chars)}
     data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
