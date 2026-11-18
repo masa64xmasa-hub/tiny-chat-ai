@@ -9,7 +9,14 @@
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee;
          display: flex; flex-direction: column; height: 100dvh; }
-  header { padding: 12px 16px; border-bottom: 1px solid #333; font-weight: bold; }
+  header { padding: 12px 16px; border-bottom: 1px solid #333; font-weight: bold; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  button.small { padding: 8px 12px; font-size: 13px; }
+  button.teach { margin-top: 6px; padding: 4px 10px; font-size: 12px; background: #444; border-radius: 8px; }
+  #export { position: fixed; inset: 0; background: rgba(0,0,0,.85); padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  #export[hidden] { display: none; }
+  #export p { margin: 0; font-size: 14px; line-height: 1.5; }
+  #exportText { flex: 1; padding: 10px; border-radius: 10px; border: 1px solid #444; background: #1c1c1c; color: #eee; font-size: 14px; }
+  #export .row { display: flex; gap: 8px; } #export .row button { padding: 12px 16px; }
   #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
   .msg { max-width: 80%; padding: 10px 14px; border-radius: 16px; line-height: 1.5; white-space: pre-wrap; }
   .me { align-self: flex-end; background: #2b6cff; }
@@ -21,12 +28,18 @@
 </style>
 </head>
 <body>
-<header>tiny-chat-ai（自作の小さなAI）</header>
+<header><span>tiny-chat-ai</span><button id="openExport" class="small">教えた内容 (<span id="count">0</span>)</button></header>
 <div id="log"></div>
 <form id="form" autocomplete="off">
   <input id="input" placeholder="メッセージを入力" enterkeyhint="send">
   <button id="send" type="submit">送信</button>
 </form>
+<div id="export" hidden>
+  <p>まだ反映していない「教えた内容」です。<b>GitHubに反映</b>を押すと data.txt に追記され、自動で再学習されます。</p>
+  <textarea id="exportText" readonly></textarea>
+  <div class="row"><button id="pushGithub">GitHubに反映</button><button id="copyExport" style="background:#444">コピー</button><button id="clearTaught" style="background:#a33">教えた内容を消す</button><button id="closeExport" style="background:#444">閉じる</button></div>
+  <p style="font-size:12px;color:#999"><a href="#" id="resetToken" style="color:#999">保存したトークンを消す</a></p>
+</div>
 <script src="app.js"></script>
 </body>
 </html>
