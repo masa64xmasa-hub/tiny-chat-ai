@@ -1,0 +1,31 @@
+name: train
+
+on:
+  push:
+    paths: ['data.txt']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PyTorch (CPU)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Train
+        run: python chat_gpt.py train
+      - name: Export model.json
+        run: python export_web.py
+      - name: Commit model.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add model.json
+          git diff --staged --quiet || git commit -m "retrain model"
+          git push
